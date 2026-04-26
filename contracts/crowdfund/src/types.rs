@@ -85,6 +85,40 @@ pub struct CampaignInfo {
     pub platform_address: Address,
 }
 
+/// Campaign update entry with IPFS hash and timestamp.
+#[derive(Clone)]
+#[contracttype]
+pub struct CampaignUpdate {
+    /// IPFS hash of the update content
+    pub ipfs_hash: String,
+    /// Timestamp when update was posted
+    pub timestamp: u64,
+}
+
+/// Milestone tracking for campaigns.
+#[derive(Clone)]
+#[contracttype]
+pub struct Milestone {
+    /// Target amount in stroops
+    pub amount: i128,
+    /// Milestone description
+    pub description: String,
+    /// Whether this milestone has been reached
+    pub reached: bool,
+}
+
+/// Matching configuration for sponsor contributions.
+#[derive(Clone)]
+#[contracttype]
+pub struct MatchingConfig {
+    /// Sponsor address providing matching funds
+    pub sponsor: Address,
+    /// Match ratio in basis points (e.g., 10000 = 1:1 match)
+    pub match_ratio: u32,
+    /// Maximum total matching amount in stroops
+    pub max_match: i128,
+}
+
 /// Storage key variants for contract data.
 ///
 /// Used to organize persistent and instance storage in the contract.
@@ -101,14 +135,16 @@ pub enum DataKey {
     LargestContribution,
     /// Whitelist of accepted token addresses
     AcceptedTokens,
-    /// Campaign verification status
-    Verified,
-    /// Anonymous contribution flag for an address
-    AnonymousContribution(Address),
-    /// Rate limit tracking: last contribution timestamp for an address
-    RateLimitTimestamp(Address),
-    /// Rate limit tracking: amount contributed in current period
-    RateLimitAmount(Address),
-    /// Emergency withdrawal lock time
-    EmergencyLockTime,
+    /// Campaign updates vector
+    Updates,
+    /// Milestones vector
+    Milestones,
+    /// Matching configuration
+    MatchingConfig,
+    /// Total matched amount
+    TotalMatched,
+    /// NFT contract address for receipts
+    NFTContract,
+    /// NFT token ID for a contributor
+    ContributorNFT(Address),
 }

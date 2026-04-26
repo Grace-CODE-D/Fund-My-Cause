@@ -7,8 +7,8 @@ mod storage;
 mod types;
 
 pub use errors::ContractError;
-pub use storage::{CONTRACT_VERSION, KEY_ADMIN, KEY_CONTRIBS, KEY_CREATOR, KEY_DEADLINE, KEY_DESC, KEY_GOAL, KEY_MIN, KEY_PLATFORM, KEY_SOCIAL, KEY_STATUS, KEY_TITLE, KEY_TOKEN, KEY_TOTAL};
-pub use types::{CampaignInfo, CampaignStats, DataKey, PlatformConfig, Status};
+pub use storage::{CONTRACT_VERSION, KEY_ADMIN, KEY_CONTRIBS, KEY_CREATOR, KEY_DEADLINE, KEY_DESC, KEY_GOAL, KEY_MIN, KEY_PLATFORM, KEY_SOCIAL, KEY_STATUS, KEY_TITLE, KEY_TOKEN, KEY_TOTAL, MAX_UPDATES, MAX_MILESTONES};
+pub use types::{CampaignInfo, CampaignStats, DataKey, PlatformConfig, Status, CampaignUpdate, Milestone, MatchingConfig};
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
 
@@ -238,9 +238,24 @@ impl CrowdfundContract {
         env.storage().persistent().set(&key, &new_amount);
         env.storage().persistent().extend_ttl(&key, 100, 100);
 
-        let total: i128 = env.storage().instance().get(&KEY_TOTAL).unwrap();
+        let mut total: i128 = env.storage().instance().get(&KEY_TOTAL).unwrap();
         let new_total = total.checked_add(amount).ok_or(ContractError::Overflow)?;
-        env.storage().instance().set(&KEY_TOTAL, &new_total);
+
+        // Apply matching if configured
+        let mut matched_amount = 0i128;
+        if let Some(config) = env.storage().instance().get::<_, MatchingConfig>(&DataKey::MatchingConfig) {
+            let match_amount = (amount * config.match_ratio as i128) / 10_000;
+            let total_matched: i128 = env.storage().instance().get(&DataKey::TotalMatched).unwrap_or(0);
+            let available_match = config.max_match - total_matched;
+            matched_amount = match_amount.min(available_match).max(0);
+            
+            if matched_amount > 0 {
+                env.storage().instance().set(&DataKey::TotalMatched, &(total_matched + matched_amount));
+            }
+        }
+
+        let final_total = new_total.checked_add(matched_amount).ok_or(ContractError::Overflow)?;
+        env.storage().instance().set(&KEY_TOTAL, &final_total);
 
         let presence_key = DataKey::ContributorPresence(contributor.clone());
         let is_present: bool = env.storage().persistent().get(&presence_key).unwrap_or(false);
@@ -735,118 +750,260 @@ impl CrowdfundContract {
         Ok(())
     }
 
-    /// Allows early refund with a penalty fee.
+    // ── Campaign Updates ──────────────────────────────────────────────────────
+
+    /// Posts a campaign update with IPFS hash.
     ///
-    /// Contributors can claim a refund before the deadline with a penalty deducted.
-    /// The penalty is sent to the platform address or creator.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `contributor` - The contributor's Stellar address
-    ///
-    /// # Returns
-    /// * `Ok(())` on success
-    /// * `Err(ContractError::NotActive)` if campaign is not active
-    /// * `Err(ContractError::GoalReached)` if goal already reached
-    ///
-    /// # Side Effects
-    /// - Transfers refund minus penalty to contributor
-    /// - Transfers penalty to platform or creator
-    /// - Sets contributor's contribution to 0
-    pub fn refund_with_penalty(env: Env, contributor: Address) -> Result<(), ContractError> {
-        let status: Status = env.storage().instance().get(&KEY_STATUS).unwrap();
-        if status != Status::Active {
-            return Err(ContractError::NotActive);
-        }
-
-        let total: i128 = env.storage().instance().get(&KEY_TOTAL).unwrap();
-        let goal: i128 = env.storage().instance().get(&KEY_GOAL).unwrap();
-        if total >= goal {
-            return Err(ContractError::GoalReached);
-        }
-
-        let key = DataKey::Contribution(contributor.clone());
-        let amount: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if amount <= 0 {
-            return Ok(());
-        }
-
-        let penalty_bps: u32 = env.storage().instance().get(&DataKey::PenaltyBps).unwrap_or(0);
-        let penalty = amount * penalty_bps as i128 / 10_000;
-        let refund = amount - penalty;
-
-        let token_address: Address = env.storage().instance().get(&KEY_TOKEN).unwrap();
-        let token_client = token::Client::new(&env, &token_address);
-
-        token_client.transfer(&env.current_contract_address(), &contributor, &refund);
-
-        if penalty > 0 {
-            let fee_recipient = if let Some(config) = env.storage().instance().get::<_, PlatformConfig>(&KEY_PLATFORM) {
-                config.address
-            } else {
-                env.storage().instance().get(&KEY_CREATOR).unwrap()
-            };
-            token_client.transfer(&env.current_contract_address(), &fee_recipient, &penalty);
-        }
-
-        env.storage().persistent().set(&key, &0i128);
-        let new_total = total - amount;
-        env.storage().instance().set(&KEY_TOTAL, &new_total);
-
-        env.events().publish(("campaign", "refund_with_penalty"), (contributor, refund, penalty));
-        Ok(())
-    }
-
-    /// Adjusts the campaign goal under certain conditions.
-    ///
-    /// Can only decrease the goal and only before any contributions are made.
+    /// Only the creator can post updates. Updates are stored on-chain with timestamp.
+    /// Limited to MAX_UPDATES per campaign to prevent unbounded storage growth.
     ///
     /// # Arguments
     /// * `env` - The Soroban environment
-    /// * `new_goal` - The new goal amount
+    /// * `ipfs_hash` - IPFS hash of the update content
     ///
     /// # Returns
     /// * `Ok(())` on success
-    /// * `Err(ContractError::NotActive)` if campaign is not active
-    /// * `Err(ContractError::CannotAdjustGoal)` if goal increase or contributions exist
-    ///
-    /// # Side Effects
-    /// - Updates goal in storage
-    /// - Records adjustment in history
-    /// - Publishes "goal_adjusted" event
-    pub fn adjust_goal(env: Env, new_goal: i128) -> Result<(), ContractError> {
-        let status: Status = env.storage().instance().get(&KEY_STATUS).unwrap();
-        if status != Status::Active {
-            return Err(ContractError::NotActive);
-        }
-
+    /// * `Err(ContractError::NotActive)` if campaign is not Active
+    /// * `Err(ContractError::Overflow)` if update limit exceeded
+    pub fn post_update(env: Env, ipfs_hash: String) -> Result<(), ContractError> {
         let creator: Address = env.storage().instance().get(&KEY_CREATOR).unwrap();
         creator.require_auth();
 
-        let current_goal: i128 = env.storage().instance().get(&KEY_GOAL).unwrap();
-        let total: i128 = env.storage().instance().get(&KEY_TOTAL).unwrap();
-
-        if new_goal > current_goal || total > 0 {
-            return Err(ContractError::CannotAdjustGoal);
+        let status: Status = env.storage().instance().get(&KEY_STATUS).unwrap();
+        if status != Status::Active {
+            return Err(ContractError::NotActive);
         }
 
-        env.storage().instance().set(&KEY_GOAL, &new_goal);
-
-        let mut history: Vec<GoalAdjustment> = env
+        let mut updates: Vec<CampaignUpdate> = env
             .storage()
             .persistent()
-            .get(&KEY_GOAL_HISTORY)
+            .get(&DataKey::Updates)
             .unwrap_or_else(|| Vec::new(&env));
-        history.push_back(GoalAdjustment {
-            previous_goal: current_goal,
-            new_goal,
+
+        if updates.len() >= MAX_UPDATES {
+            return Err(ContractError::Overflow);
+        }
+
+        updates.push_back(CampaignUpdate {
+            ipfs_hash,
             timestamp: env.ledger().timestamp(),
         });
-        env.storage().persistent().set(&KEY_GOAL_HISTORY, &history);
-        env.storage().persistent().extend_ttl(&KEY_GOAL_HISTORY, 100, 100);
 
-        env.events().publish(("campaign", "goal_adjusted"), (current_goal, new_goal));
+        env.storage().persistent().set(&DataKey::Updates, &updates);
+        env.storage().persistent().extend_ttl(&DataKey::Updates, 100, 100);
+        env.events().publish(("campaign", "update_posted"), ());
         Ok(())
+    }
+
+    /// Retrieves all campaign updates.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Vector of CampaignUpdate entries
+    pub fn get_updates(env: Env) -> Vec<CampaignUpdate> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Updates)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Milestones ────────────────────────────────────────────────────────────
+
+    /// Initializes campaign milestones.
+    ///
+    /// Only the creator can set milestones. Limited to MAX_MILESTONES per campaign.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `milestones` - Vector of Milestone structs
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(ContractError::NotActive)` if campaign is not Active
+    /// * `Err(ContractError::Overflow)` if milestone limit exceeded
+    pub fn set_milestones(env: Env, milestones: Vec<Milestone>) -> Result<(), ContractError> {
+        let creator: Address = env.storage().instance().get(&KEY_CREATOR).unwrap();
+        creator.require_auth();
+
+        let status: Status = env.storage().instance().get(&KEY_STATUS).unwrap();
+        if status != Status::Active {
+            return Err(ContractError::NotActive);
+        }
+
+        if milestones.len() > MAX_MILESTONES {
+            return Err(ContractError::Overflow);
+        }
+
+        env.storage().persistent().set(&DataKey::Milestones, &milestones);
+        env.storage().persistent().extend_ttl(&DataKey::Milestones, 100, 100);
+        env.events().publish(("campaign", "milestones_set"), ());
+        Ok(())
+    }
+
+    /// Retrieves campaign milestones with updated reached status.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Vector of Milestone entries with current reached status
+    pub fn get_milestones(env: Env) -> Vec<Milestone> {
+        let mut milestones: Vec<Milestone> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Milestones)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total: i128 = env.storage().instance().get(&KEY_TOTAL).unwrap_or(0);
+
+        for i in 0..milestones.len() {
+            let mut milestone = milestones.get(i).unwrap();
+            milestone.reached = total >= milestone.amount;
+            milestones.set(i, milestone);
+        }
+
+        milestones
+    }
+
+    // ── Contribution Matching ─────────────────────────────────────────────────
+
+    /// Sets up matching configuration for sponsor contributions.
+    ///
+    /// Only the creator can set up matching. Replaces any existing configuration.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `sponsor` - Sponsor address providing matching funds
+    /// * `match_ratio` - Match ratio in basis points (e.g., 10000 = 1:1)
+    /// * `max_match` - Maximum total matching amount
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(ContractError::NotActive)` if campaign is not Active
+    pub fn setup_matching(
+        env: Env,
+        sponsor: Address,
+        match_ratio: u32,
+        max_match: i128,
+    ) -> Result<(), ContractError> {
+        let creator: Address = env.storage().instance().get(&KEY_CREATOR).unwrap();
+        creator.require_auth();
+
+        let status: Status = env.storage().instance().get(&KEY_STATUS).unwrap();
+        if status != Status::Active {
+            return Err(ContractError::NotActive);
+        }
+
+        let config = MatchingConfig {
+            sponsor,
+            match_ratio,
+            max_match,
+        };
+
+        env.storage().instance().set(&DataKey::MatchingConfig, &config);
+        env.storage().instance().set(&DataKey::TotalMatched, &0i128);
+        env.events().publish(("campaign", "matching_setup"), ());
+        Ok(())
+    }
+
+    /// Withdraws matched funds for the sponsor.
+    ///
+    /// Sponsor can withdraw their matched contribution after campaign success.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(ContractError::NotActive)` if campaign is not Successful
+    /// * `Err(ContractError::GoalNotReached)` if goal not reached
+    pub fn withdraw_matching(env: Env) -> Result<(), ContractError> {
+        let status: Status = env.storage().instance().get(&KEY_STATUS).unwrap();
+        if status != Status::Successful {
+            return Err(ContractError::NotActive);
+        }
+
+        let config: MatchingConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MatchingConfig)
+            .ok_or(ContractError::NotActive)?;
+
+        config.sponsor.require_auth();
+
+        let total_matched: i128 = env.storage().instance().get(&DataKey::TotalMatched).unwrap_or(0);
+        if total_matched > 0 {
+            let token_address: Address = env.storage().instance().get(&KEY_TOKEN).unwrap();
+            token::Client::new(&env, &token_address)
+                .transfer(&env.current_contract_address(), &config.sponsor, &total_matched);
+            env.storage().instance().set(&DataKey::TotalMatched, &0i128);
+            env.events().publish(("campaign", "matching_withdrawn"), total_matched);
+        }
+
+        Ok(())
+    }
+
+    // ── NFT Receipts ──────────────────────────────────────────────────────────
+
+    /// Sets the NFT contract address for contribution receipts.
+    ///
+    /// Only the creator can set the NFT contract.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `nft_contract` - Address of the NFT contract
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    pub fn set_nft_contract(env: Env, nft_contract: Address) -> Result<(), ContractError> {
+        let creator: Address = env.storage().instance().get(&KEY_CREATOR).unwrap();
+        creator.require_auth();
+
+        env.storage().instance().set(&DataKey::NFTContract, &nft_contract);
+        env.events().publish(("campaign", "nft_contract_set"), ());
+        Ok(())
+    }
+
+    /// Retrieves the NFT contract address if set.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    ///
+    /// # Returns
+    /// Optional NFT contract address
+    pub fn get_nft_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::NFTContract)
+    }
+
+    /// Records an NFT receipt for a contributor.
+    ///
+    /// Called internally when minting NFT receipts for contributions.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `contributor` - Contributor address
+    /// * `token_id` - NFT token ID
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    pub fn record_nft_receipt(env: Env, contributor: Address, token_id: i128) -> Result<(), ContractError> {
+        env.storage().persistent().set(&DataKey::ContributorNFT(contributor.clone()), &token_id);
+        env.storage().persistent().extend_ttl(&DataKey::ContributorNFT(contributor), 100, 100);
+        Ok(())
+    }
+
+    /// Retrieves the NFT token ID for a contributor.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `contributor` - Contributor address
+    ///
+    /// # Returns
+    /// Optional NFT token ID
+    pub fn get_contributor_nft(env: Env, contributor: Address) -> Option<i128> {
+        env.storage().persistent().get(&DataKey::ContributorNFT(contributor))
     }
 
     // ── View functions ────────────────────────────────────────────────────────
