@@ -23,3 +23,5 @@ export { useComments } from "./useComments";
 export { useBreakpoint } from "./useBreakpoint";
 export { useFocusTrap } from "./useFocusTrap";
 export { useFormValidation } from "./useFormValidation";
+export { useInputMask } from "./useInputMask";
+export type { MaskType, UseMaskResult } from "./useInputMask";
